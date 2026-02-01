@@ -1,11 +1,10 @@
-# Poster / Marquee lights - Step 4
-# - Tick-based, non-blocking effects
-# - SPA-style web UI (fetch; no navigation)
-# - JSON API under /api/*
-# - /api/event for semantic triggers (Pico chooses show)
-# - /api/progress for Jellyfin-style progress bar mode (push from a Pi)
-#
-# Raspberry Pi Pico W (MicroPython)
+# Poster / Marquee lights - Step 5
+# - Adds Progress Mode (enable/disable)
+# - Progress uses configurable arc (default start=1 end=18) with dim warm trim outside arc
+# - Playing: fill-with-fade + twinkle on filled pixels
+# - Paused: two opposite orbiting bulbs
+# - When progress mode is enabled AND progress is active, show triggers are ignored
+# - /api/status advertises show defaults (UI no longer hardcodes durations)
 
 import network
 import asyncio
@@ -22,6 +21,11 @@ import config
 SSID = config.REMOTE_SSID
 PASSWORD = config.REMOTE_PASSWORD
 
+# Static IP configuration
+static_ip = '192.168.0.250'  # Replace with your desired static IP
+subnet_mask = '255.255.255.0'
+gateway_ip = '192.168.0.255'
+dns_server = '8.8.8.8'
 
 def init_wifi(ssid: str, password: str) -> bool:
     wlan = network.WLAN(network.STA_IF)
@@ -35,6 +39,9 @@ def init_wifi(ssid: str, password: str) -> bool:
             break
         timeout -= 1
         time.sleep(1)
+        
+    # Set static IP address
+    wlan.ifconfig((static_ip, subnet_mask, gateway_ip, dns_server))
 
     if wlan.status() != 3:
         print("Wi-Fi connect failed, status:", wlan.status())
@@ -43,12 +50,11 @@ def init_wifi(ssid: str, password: str) -> bool:
     print("Wi-Fi connected, IP:", wlan.ifconfig()[0])
     return True
 
-
 # -------------------------------
 # NeoPixel configuration
 # -------------------------------
 NEOPIXEL_PIN = 28
-NEOPIXEL_COUNT = 20  # change to 40/60 if you add strips later
+NEOPIXEL_COUNT = 20
 
 np = neopixel.NeoPixel(Pin(NEOPIXEL_PIN, Pin.OUT), NEOPIXEL_COUNT)
 
@@ -56,7 +62,7 @@ neopixel_enabled = True
 
 # User-adjustable globals (via /api/config)
 brightness = 0.60     # 0..1
-speed = 1.00          # 0.2..3.0 (multiplier, higher is faster)
+speed = 1.00          # 0.2..3.0
 
 def clamp(x, lo, hi):
     if x < lo:
@@ -78,20 +84,20 @@ def clear_np():
         np[i] = (0, 0, 0)
     np.write()
 
-# Colors in normal RGB; converted via neo_color_rgb()
+# Colors in normal RGB
 WARM = (255, 140, 20)
 SOFT_WARM = (255, 100, 10)
 GOLD = (255, 180, 30)
-COOL = (50, 120, 255)  # used for progress head highlight if desired
+RED = (255, 0, 0)
+WHITE = (255, 255, 255)
 
 def scale_rgb(rgb, s: float):
     s = clamp(float(s), 0.0, 1.0)
     r, g, b = rgb
     return (int(r * s), int(g * s), int(b * s))
 
-
 # -------------------------------
-# Config (no magic numbers live in code anymore)
+# Config
 # -------------------------------
 EFFECT_CONFIG = {
     "twinkle": {
@@ -138,14 +144,24 @@ EFFECT_CONFIG = {
 
     "progress": {
         "filled_color": WARM,
-        "empty_dim": 0.04,          # unfilled segment brightness
-        "filled_dim": 0.70,         # filled segment brightness
-        "head_boost": 0.25,         # extra brightness at the head
+        "empty_dim": 0.04,          # within arc, ahead of head
+        "filled_dim": 0.70,         # base brightness for filled pixels
+        "head_dim": 0.85,           # max brightness for active head pixel
         "frame_ms": 50,
-        "timeout_ms": 30000,        # if no updates in 30s, revert to idle
-        "paused_blink_ms": 500,     # head blink rate when paused
+        "timeout_ms": 30000,
+        "trim_dim": 0.10,           # pixels outside arc (dim warm trim)
+        "twinkle_strength": 0.22,   # how much twinkle modulates filled pixels
+        "pause_step_ms": 170,       # orbit speed
+        "pause_dim": 0.85,          # brightness of orbit bulbs
     },
 }
+
+# Defaults: use pixels 1..18 (zero-based) for progress
+progress_start = 1
+progress_end = 18
+
+# Progress mode toggle (OFF by default)
+progress_mode_enabled = False
 
 # -------------------------------
 # URL parsing helpers
@@ -189,14 +205,12 @@ def as_str(params, key, default=""):
 class Effect:
     def reset(self):
         pass
-
     def tick(self, now_ms: int):
         pass
 
 def scaled_ms(base_ms: int) -> int:
     sp = clamp(float(speed), 0.2, 3.0)
     return int(max(5, base_ms / sp))
-
 
 class BreathingGlow(Effect):
     def __init__(self, cfg):
@@ -231,7 +245,6 @@ class BreathingGlow(Effect):
 
         self._phase += self.phase_step
 
-
 class MarqueeChase(Effect):
     def __init__(self, cfg):
         self.color = cfg["color"]
@@ -263,9 +276,7 @@ class MarqueeChase(Effect):
         np.write()
         self._offset = (self._offset + 1) % self.bulb_every
 
-
 class BulbTwinkle(Effect):
-    """Obvious but classy marquee-style twinkle."""
     def __init__(self, cfg):
         self.color = cfg["color"]
         self.base_min = cfg["base_min"]
@@ -320,8 +331,7 @@ class BulbTwinkle(Effect):
 
         np.write()
 
-
-# --- Show effects (overlay) ---
+# --- Shows ---
 class DoubleChaseShow(Effect):
     def __init__(self, cfg):
         self.color = cfg["color"]
@@ -365,17 +375,15 @@ class DoubleChaseShow(Effect):
         self._a = (self._a + 1) % NEOPIXEL_COUNT
         self._b = (self._b - 1) % NEOPIXEL_COUNT
 
-
 class WipeHoldPopShow(Effect):
-    # Loops until show time ends: wipe on -> hold+pops -> wipe off -> repeat
+    # loops until show time ends
     def __init__(self, cfg):
         self.color = cfg["color"]
         self.pop_color = cfg["pop_color"]
         self.hold_s = cfg["hold_s"]
         self.pop_rate = cfg["pop_rate"]
         self.base_step_ms = cfg["step_ms"]
-
-        self._stage = 0  # 0 wipe on, 1 hold, 2 wipe off
+        self._stage = 0
         self._idx = 0
         self._hold_until = 0
         self._next_ms = 0
@@ -427,31 +435,113 @@ class WipeHoldPopShow(Effect):
                 self._stage = 0
                 self._idx = 0
 
-
-# --- Progress bar effect (push-driven) ---
-class ProgressBar(Effect):
+class MovieWipeOnce(Effect):
     """
-    Renders a progress bar around the strip.
-    Use via /api/progress?pct=0.0..1.0&state=playing|paused|stopped
-
-    When active (recent updates), it overrides idle (but NOT a show overlay).
+    Single-run wipe (alternating colors) across the progress arc.
+    Intended for movie_start/movie_stop.
     """
-    def __init__(self, cfg):
+    def __init__(self, colors, direction=1, step_ms=30):
+        self.colors = colors
+        self.direction = 1 if direction >= 0 else -1
+        self.step_ms = step_ms
+        self._next_ms = 0
+        self._pos = 0
+        self._pixels = []
+
+    def reset(self):
+        self._next_ms = 0
+        self._pos = 0
+        self._pixels = get_progress_pixels()
+
+    def tick(self, now_ms: int):
+        if not neopixel_enabled:
+            return
+        if time.ticks_diff(now_ms, self._next_ms) < 0:
+            return
+        self._next_ms = time.ticks_add(now_ms, scaled_ms(self.step_ms))
+
+        px = self._pixels
+        if not px:
+            return
+
+        # dim trim outside arc
+        trim_c = neo_color_rgb(*scale_rgb(WARM, EFFECT_CONFIG["progress"]["trim_dim"]))
+        for i in range(NEOPIXEL_COUNT):
+            np[i] = trim_c
+
+        # render wipe up to pos
+        count = min(self._pos + 1, len(px))
+        for k in range(count):
+            idx = px[k] if self.direction == 1 else px[len(px) - 1 - k]
+            col = self.colors[k % len(self.colors)]
+            np[idx] = neo_color_rgb(*scale_rgb(col, 0.90))
+
+        np.write()
+        self._pos += 1
+        if self._pos >= len(px):
+            # hold finished frame; engine timer will end show
+            self._pos = len(px) - 1
+
+# -------------------------------
+# Progress helpers + Progress effect (v2)
+# -------------------------------
+def normalize_index(i):
+    # allow negatives etc
+    return int(i) % NEOPIXEL_COUNT
+
+def get_progress_pixels():
+    """
+    Returns list of pixel indices from progress_start..progress_end inclusive,
+    wrapping if end < start.
+    """
+    if NEOPIXEL_COUNT <= 0:
+        return []
+    s = normalize_index(progress_start)
+    e = normalize_index(progress_end)
+    out = [s]
+    while out[-1] != e:
+        out.append((out[-1] + 1) % NEOPIXEL_COUNT)
+        if len(out) > NEOPIXEL_COUNT:
+            break
+    return out
+
+class ProgressBarV2(Effect):
+    """
+    /api/progress?pct=0..1&state=playing|paused|stopped
+    If active, and progress mode enabled, it overrides idle and ignores shows.
+    """
+    def __init__(self, cfg, twinkle_cfg):
         self.cfg = cfg
+        self.tw_cfg = twinkle_cfg
+
         self._next_ms = 0
         self.pct = 0.0
         self.state = "stopped"
         self._last_update_ms = 0
-        self._blink_on = True
-        self._next_blink_ms = 0
-        self._phase = 0.0
+        self._pause_phase = 0.0
+
+
+        # twinkle state (only used for filled pixels)
+        self._base = [0.0] * NEOPIXEL_COUNT
+        self._tw = [0.0] * NEOPIXEL_COUNT
+
+        # pause orbit state
+        self._pause_next_ms = 0
+        self._pause_pos = 0
+
+        self._pixels = []
 
     def reset(self):
         self._next_ms = 0
         self._last_update_ms = 0
-        self._blink_on = True
-        self._next_blink_ms = 0
-        self._phase = 0.0
+        self._pause_next_ms = 0
+        self._pause_pos = 0
+        self._pause_phase = 0.0
+        self._pixels = get_progress_pixels()
+        # init twinkle baselines
+        for i in range(NEOPIXEL_COUNT):
+            self._base[i] = self.tw_cfg["base_min"] + random.random() * (self.tw_cfg["base_max"] - self.tw_cfg["base_min"])
+            self._tw[i] = 0.0
 
     def update(self, now_ms: int, pct: float, state: str):
         self.pct = clamp(pct, 0.0, 1.0)
@@ -461,60 +551,160 @@ class ProgressBar(Effect):
     def active(self, now_ms: int) -> bool:
         return time.ticks_diff(now_ms, time.ticks_add(self._last_update_ms, self.cfg["timeout_ms"])) < 0
 
+    def _tick_twinkle_state(self):
+        # same feel as idle twinkle but slightly toned
+        if random.random() < self.tw_cfg["twinkle_chance"]:
+            j = random.randrange(NEOPIXEL_COUNT)
+            boost = self.tw_cfg["twinkle_boost_min"] + random.random() * (self.tw_cfg["twinkle_boost_max"] - self.tw_cfg["twinkle_boost_min"])
+            if boost > self._tw[j]:
+                self._tw[j] = boost
+
+        for i in range(NEOPIXEL_COUNT):
+            self._base[i] += (random.random() - 0.5) * 0.03
+            if self._base[i] < self.tw_cfg["base_min"]:
+                self._base[i] = self.tw_cfg["base_min"]
+            if self._base[i] > self.tw_cfg["base_max"]:
+                self._base[i] = self.tw_cfg["base_max"]
+
+            self._tw[i] *= self.tw_cfg["twinkle_decay"]
+            if self._tw[i] < 0.01:
+                self._tw[i] = 0.0
+
     def tick(self, now_ms: int):
         if not neopixel_enabled:
             return
-        if time.ticks_diff(now_ms, self._next_ms) < 0:
+
+        # refresh pixel arc if config changed
+        if not self._pixels:
+            self._pixels = get_progress_pixels()
+
+        if self.state == "paused":
+            # render paused as "breathing" on filled portion (keeps progress visible)
+            if time.ticks_diff(now_ms, self._next_ms) < 0:
+                return
+            self._next_ms = time.ticks_add(now_ms, scaled_ms(self.cfg["frame_ms"]))
+
+            self._pause_phase += 0.06  # pulse speed; adjust later if needed
+            self._render_paused_breath()
             return
 
+        # playing render timer
+        if time.ticks_diff(now_ms, self._next_ms) < 0:
+            return
         self._next_ms = time.ticks_add(now_ms, scaled_ms(self.cfg["frame_ms"]))
 
-        filled_color = self.cfg["filled_color"]
-        empty_dim = self.cfg["empty_dim"]
-        filled_dim = self.cfg["filled_dim"]
-        head_boost = self.cfg["head_boost"]
+        if self.state == "stopped":
+            return
 
-        # compute how many pixels are "filled"
-        n = NEOPIXEL_COUNT
-        filled = int(self.pct * n + 0.0001)
-        if filled > n:
+        self._tick_twinkle_state()
+        self._render_playing()
+
+    def _render_trim(self):
+        trim_c = neo_color_rgb(*scale_rgb(WARM, self.cfg["trim_dim"]))
+        for i in range(NEOPIXEL_COUNT):
+            np[i] = trim_c
+
+    def _render_paused_breath(self):
+        self._render_trim()
+        px = self._pixels
+        if not px:
+            np.write()
+            return
+
+        n = len(px)
+        x = clamp(self.pct, 0.0, 1.0) * n
+        filled = int(x)
+        frac = x - filled
+        if filled < 0:
+            filled = 0
+            frac = 0.0
+        if filled >= n:
             filled = n
+            frac = 1.0
 
-        # head pixel index (where progress currently is)
-        head = filled if filled < n else n - 1
+        filled_color = self.cfg["filled_color"]
 
-        # paused blink logic (blink the head)
-        if self.state == "paused":
-            if self._next_blink_ms == 0:
-                self._next_blink_ms = time.ticks_add(now_ms, self.cfg["paused_blink_ms"])
-            if time.ticks_diff(now_ms, self._next_blink_ms) >= 0:
-                self._blink_on = not self._blink_on
-                self._next_blink_ms = time.ticks_add(now_ms, self.cfg["paused_blink_ms"])
-        else:
-            self._blink_on = True
-            self._next_blink_ms = 0
+        # slow pulse factor (like breath)
+        w = (math.sin(self._pause_phase) + 1.0) * 0.5  # 0..1
+        # pulse the filled region between ~70% and 100% of filled_dim
+        base = self.cfg["filled_dim"]
+        pulse_scale = 0.10 + 0.90 * w
+        filled_s = clamp(base * pulse_scale, 0.0, 1.0)
 
-        # subtle "life" in filled area (very gentle pulse)
-        self._phase += 0.05
-        pulse = 0.05 * (math.sin(self._phase) + 1.0) * 0.5  # 0..~0.05
+        # filled pixels pulse
+        for k in range(min(filled, n)):
+            idx = px[k]
+            r, g, b = scale_rgb(filled_color, filled_s)
+            np[idx] = neo_color_rgb(r, g, b)
 
-        for i in range(n):
-            if i < filled:
-                s = clamp(filled_dim + pulse, 0.0, 1.0)
-                r, g, b = scale_rgb(filled_color, s)
-                np[i] = neo_color_rgb(r, g, b)
-            else:
-                r, g, b = scale_rgb(filled_color, empty_dim)
-                np[i] = neo_color_rgb(r, g, b)
+        # head pixel shows partial progress (steady)
+        if filled < n:
+            idx = px[filled]
+            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac
+            r, g, b = scale_rgb(filled_color, clamp(head_s, 0.0, 1.0))
+            np[idx] = neo_color_rgb(r, g, b)
 
-        # head highlight
-        if n > 0 and self._blink_on and self.state != "stopped":
-            base = filled_dim
-            r, g, b = scale_rgb(filled_color, clamp(base + head_boost, 0.0, 1.0))
-            np[head] = neo_color_rgb(r, g, b)
+            # unfilled arc remains dim
+            empty_c = neo_color_rgb(*scale_rgb(filled_color, self.cfg["empty_dim"]))
+            for k in range(filled + 1, n):
+                np[px[k]] = empty_c
 
         np.write()
 
+    def _render_playing(self):
+        self._render_trim()
+        px = self._pixels
+        if not px:
+            np.write()
+            return
+
+        n = len(px)
+        x = clamp(self.pct, 0.0, 1.0) * n
+        filled = int(x)
+        frac = x - filled
+
+        # clamp indices
+        if filled < 0:
+            filled = 0
+            frac = 0.0
+        if filled >= n:
+            filled = n
+            frac = 1.0
+
+        filled_color = self.cfg["filled_color"]
+
+        # render filled pixels with twinkle
+        strength = self.cfg["twinkle_strength"]
+        base_dim = self.cfg["filled_dim"]
+
+        for k in range(min(filled, n)):
+            idx = px[k]
+            level = self._base[idx] + self._tw[idx]
+            # normalize around twinkle's min/max into ~0..1
+            tw_min = self.tw_cfg["base_min"]
+            tw_max = self.tw_cfg["base_max"] + self.tw_cfg["twinkle_boost_max"]
+            t = (level - tw_min) / max(0.0001, (tw_max - tw_min))
+            t = clamp(t, 0.0, 1.0)
+            s = clamp(base_dim + strength * (t - 0.5), 0.0, 1.0)
+            r, g, b = scale_rgb(filled_color, s)
+            np[idx] = neo_color_rgb(r, g, b)
+
+        # render head pixel fade-up
+        if filled < n:
+            idx = px[filled]
+            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac
+            r, g, b = scale_rgb(filled_color, clamp(head_s, 0.0, 1.0))
+            np[idx] = neo_color_rgb(r, g, b)
+
+            # pixels ahead in arc (within arc) get empty_dim
+            empty_c = neo_color_rgb(*scale_rgb(filled_color, self.cfg["empty_dim"]))
+            for k in range(filled + 1, n):
+                np[px[k]] = empty_c
+        else:
+            # fully complete: all arc pixels filled (twinkle)
+            pass
+
+        np.write()
 
 # -------------------------------
 # Registries / state
@@ -528,43 +718,49 @@ SHOW_EFFECTS = {
     "wipe": WipeHoldPopShow(EFFECT_CONFIG["wipe_show"]),
     "double": DoubleChaseShow(EFFECT_CONFIG["double_show"]),
     "marquee": MarqueeChase(EFFECT_CONFIG["marquee"]),
+    # movie-specific wipes (single-run, timer still bounds it)
+    "movie_play": MovieWipeOnce(colors=[RED, SOFT_WARM], direction=1, step_ms=28),
+    "movie_stop": MovieWipeOnce(colors=[SOFT_WARM, RED], direction=-1, step_ms=28),
 }
 
-# Default idle
+SHOW_DEFAULT_SECONDS = {
+    "wipe": 8,
+    "double": 10,
+    "marquee": 10,
+    "movie_play": 6,
+    "movie_stop": 6,
+}
+
 idle_name = "twinkle"
 idle_effect = IDLE_EFFECTS[idle_name]
 idle_effect.reset()
 
-# Show overlay state
 show_active = False
 show_name = ""
 show_effect = None
 show_until_ms = 0
 
-# Demo mode (cycles idle effects only, never interrupts show)
 demo_mode = False
 demo_interval_s = 15
 _last_demo_switch_ms = 0
 _demo_order = ["twinkle", "breath"]
 _demo_idx = 0
 
-# Progress mode (push updates); overrides idle when active; does NOT interrupt shows
-progress_effect = ProgressBar(EFFECT_CONFIG["progress"])
+progress_effect = ProgressBarV2(EFFECT_CONFIG["progress"], EFFECT_CONFIG["twinkle"])
 progress_effect.reset()
 
-# Event mapping: send semantic events, Pico picks show/duration
-# (You can change these without touching your Pi)
 EVENT_MAP = {
-    # event_name: {"shows": [list], "seconds": default_duration, "mode": optional idle change}
     "bulb_change": {"shows": ["wipe", "double", "marquee"], "seconds": 8},
-    "movie_start":  {"shows": ["wipe"], "seconds": 10},
-    "movie_pause":  {"shows": ["double"], "seconds": 6},
-    "movie_stop":   {"shows": ["wipe"], "seconds": 6},
+    # for Jellyfin brain to call:
+    "movie_start": {"shows": ["movie_play"], "seconds": 6},
+    "movie_pause": {"shows": ["double"], "seconds": 6},
+    "movie_stop":  {"shows": ["movie_stop"], "seconds": 6},
 }
 
-# To avoid repeating the same show every time, we rotate within each event
 _event_rotator = {k: 0 for k in EVENT_MAP.keys()}
 
+def in_active_progress(now_ms: int) -> bool:
+    return progress_mode_enabled and progress_effect.active(now_ms) and progress_effect.state != "stopped"
 
 def set_idle(name: str) -> bool:
     global idle_name, idle_effect
@@ -575,19 +771,26 @@ def set_idle(name: str) -> bool:
     idle_effect.reset()
     return True
 
-
-def start_show(name: str, seconds: int) -> bool:
+def start_show(name: str, seconds: int, now_ms: int = None) -> (bool, str):
     global show_active, show_name, show_effect, show_until_ms
+
+    if now_ms is None:
+        now_ms = time.ticks_ms()
+
+    # Ignore shows while active progress is driving visuals
+    if in_active_progress(now_ms):
+        return (False, "ignored_during_progress")
+
     if name not in SHOW_EFFECTS:
-        return False
+        return (False, "unknown_show")
+
     seconds = int(clamp(seconds, 1, 60))
     show_name = name
     show_effect = SHOW_EFFECTS[name]
     show_effect.reset()
     show_active = True
-    show_until_ms = time.ticks_add(time.ticks_ms(), seconds * 1000)
-    return True
-
+    show_until_ms = time.ticks_add(now_ms, seconds * 1000)
+    return (True, "ok")
 
 def stop_show():
     global show_active, show_name, show_effect, show_until_ms
@@ -596,11 +799,14 @@ def stop_show():
     show_effect = None
     show_until_ms = 0
 
+def trigger_event(event_name: str, seconds_override: int = None, now_ms: int = None) -> dict:
+    if now_ms is None:
+        now_ms = time.ticks_ms()
 
-def trigger_event(event_name: str, seconds_override: int = None) -> dict:
-    """
-    Returns dict with result info: {"ok": bool, "event":..., "show":..., "seconds":..., "message":...}
-    """
+    # Ignore show-starting events while active progress is driving visuals
+    if in_active_progress(now_ms):
+        return {"ok": True, "event": event_name, "message": "ignored_during_progress"}
+
     if event_name not in EVENT_MAP:
         return {"ok": False, "event": event_name, "message": "Unknown event"}
 
@@ -609,7 +815,6 @@ def trigger_event(event_name: str, seconds_override: int = None) -> dict:
     if not shows:
         return {"ok": False, "event": event_name, "message": "No shows configured for event"}
 
-    # rotate show choice per event (predictable)
     idx = _event_rotator.get(event_name, 0) % len(shows)
     _event_rotator[event_name] = idx + 1
     chosen = shows[idx]
@@ -618,15 +823,14 @@ def trigger_event(event_name: str, seconds_override: int = None) -> dict:
     if seconds_override is not None:
         seconds = int(clamp(seconds_override, 1, 60))
 
-    ok = start_show(chosen, seconds)
+    ok, reason = start_show(chosen, seconds, now_ms=now_ms)
     return {
         "ok": ok,
         "event": event_name,
-        "show": chosen,
+        "show": chosen if ok else "",
         "seconds": seconds,
-        "message": "OK" if ok else "Failed to start show",
+        "message": "OK" if ok else reason,
     }
-
 
 def status_dict():
     now = time.ticks_ms()
@@ -641,19 +845,22 @@ def status_dict():
         "show_ms_remaining": max(0, time.ticks_diff(show_until_ms, now)) if show_active else 0,
         "demo": demo_mode,
         "demo_interval_s": demo_interval_s,
+
+        "progress_mode_enabled": progress_mode_enabled,
         "progress_active": progress_effect.active(now),
         "progress_pct": progress_effect.pct,
         "progress_state": progress_effect.state,
-        
-        # NEW: advertise capabilities for dynamic UI
+        "progress_start": progress_start,
+        "progress_end": progress_end,
+
         "idle_modes": list(IDLE_EFFECTS.keys()),
         "show_modes": list(SHOW_EFFECTS.keys()),
+        "show_defaults": SHOW_DEFAULT_SECONDS,
         "events": list(EVENT_MAP.keys()),
     }
 
-
 # -------------------------------
-# Minimal JSON encoder (enough for our simple dicts)
+# Minimal JSON encoder
 # -------------------------------
 def json_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
@@ -664,7 +871,6 @@ def to_json(v):
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
-        # keep it simple
         return str(v)
     if isinstance(v, str):
         return '"' + json_escape(v) + '"'
@@ -676,7 +882,6 @@ def to_json(v):
     if isinstance(v, (list, tuple)):
         return "[" + ",".join(to_json(x) for x in v) + "]"
     return to_json(str(v))
-
 
 # -------------------------------
 # Engine task
@@ -691,8 +896,8 @@ async def neopixel_engine_task():
             await asyncio.sleep_ms(50)
             continue
 
-        # demo: cycles idle effects, but never interrupts a show
-        if demo_mode and (not show_active):
+        # demo cycles idle effects only when not showing and not active progress
+        if demo_mode and (not show_active) and (not in_active_progress(now)):
             if _last_demo_switch_ms == 0:
                 _last_demo_switch_ms = now
             if time.ticks_diff(now, _last_demo_switch_ms) >= int(demo_interval_s * 1000):
@@ -700,24 +905,28 @@ async def neopixel_engine_task():
                 set_idle(_demo_order[_demo_idx])
                 _last_demo_switch_ms = now
 
-        # show overlay wins
+        # If active progress is driving, it overrides everything (per your spec)
+        if in_active_progress(now):
+            # ensure any existing show doesn't keep running behind the scenes
+            if show_active:
+                stop_show()
+            progress_effect.tick(now)
+            await asyncio.sleep_ms(10)
+            continue
+
+        # otherwise: shows then idle/progress fallback (progress only if enabled? no: still allowed)
         if show_active and show_effect is not None:
             show_effect.tick(now)
             if time.ticks_diff(now, show_until_ms) >= 0:
                 stop_show()
-
         else:
-            # progress overrides idle if active
-            if progress_effect.active(now) and progress_effect.state != "stopped":
-                progress_effect.tick(now)
-            else:
-                idle_effect.tick(now)
+            # if progress mode is enabled but not active (timed out), just idle
+            idle_effect.tick(now)
 
         await asyncio.sleep_ms(10)
 
-
 # -------------------------------
-# Web UI (single page; JS fetches /api/*)
+# Web UI
 # -------------------------------
 def html_page():
     timeout_s = int(EFFECT_CONFIG["progress"]["timeout_ms"] / 1000)
@@ -735,7 +944,7 @@ Connection: close\r
     body {{ font-family: sans-serif; margin: 16px; }}
     .row {{ margin: 10px 0; display: flex; flex-wrap: wrap; gap: 8px; }}
     button {{ padding: 12px 14px; }}
-    input, select {{ padding: 10px; }}
+    input {{ padding: 10px; }}
     .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 10px 0; }}
     pre {{ white-space: pre-wrap; margin: 0; }}
     .small {{ color:#666; font-size: 0.92em; }}
@@ -759,6 +968,17 @@ Connection: close\r
   </div>
 
   <div class="card">
+    <b>Progress Mode</b>
+    <div class="row">
+      <button onclick="api('/api/progress_mode?on=1')">Progress Mode ON</button>
+      <button onclick="api('/api/progress_mode?on=0')">Progress Mode OFF</button>
+    </div>
+    <div class="small">
+      When ON and Jellyfin updates are active, show triggers are ignored. If updates stop for ~{timeout_s}s, it falls back to idle.
+    </div>
+  </div>
+
+  <div class="card">
     <b>Idle Mode (runs continuously)</b>
     <div id="idleButtons" class="row"></div>
   </div>
@@ -766,7 +986,6 @@ Connection: close\r
   <div class="card">
     <b>Show (temporary overlay)</b>
     <div id="showButtons" class="row"></div>
-
     <div class="small">Or trigger semantic events:</div>
     <div id="eventButtons" class="row"></div>
   </div>
@@ -790,19 +1009,17 @@ Connection: close\r
       </label>
       <button onclick="applyConfig()">Apply</button>
     </div>
-    <div class="small">Tip: your Pi can call <code>/api/event?name=bulb_change</code> or <code>/api/progress?pct=0.42&state=playing</code></div>
   </div>
 
   <div class="card">
-    <b>Progress Bar (test)</b>
+    <b>Progress (test)</b>
     <div class="row">
       <button onclick="api('/api/progress?pct=0.10&state=playing')">10%</button>
       <button onclick="api('/api/progress?pct=0.50&state=playing')">50%</button>
       <button onclick="api('/api/progress?pct=0.90&state=playing')">90%</button>
       <button onclick="api('/api/progress?pct=0.90&state=paused')">Paused @ 90%</button>
-      <button onclick="api('/api/progress?state=stopped')">Stop progress mode</button>
+      <button onclick="api('/api/progress?state=stopped')">Stop progress</button>
     </div>
-    <div class="small">If no progress updates arrive for ~{timeout_s}s, it returns to idle automatically.</div>
   </div>
 
 <script>
@@ -840,7 +1057,6 @@ function renderButtons(data) {{
   const idleWrap = document.getElementById("idleButtons");
   const showWrap = document.getElementById("showButtons");
   const eventWrap = document.getElementById("eventButtons");
-
   idleWrap.innerHTML = "";
   showWrap.innerHTML = "";
   eventWrap.innerHTML = "";
@@ -853,8 +1069,9 @@ function renderButtons(data) {{
     );
   }});
 
+  const defaults = data.show_defaults || {{}};
   (data.show_modes || []).forEach(function(name) {{
-    const seconds = (name === "wipe") ? 8 : (name === "double") ? 10 : 10;
+    const seconds = defaults[name] || 10;
     showWrap.appendChild(
       makeButton(name + " (" + seconds + "s)", function() {{
         api("/api/show?name=" + encodeURIComponent(name) + "&seconds=" + seconds);
@@ -871,13 +1088,23 @@ function renderButtons(data) {{
   }});
 }}
 
+function safeSetInput(id, newValue) {{
+  const el = document.getElementById(id);
+  if (!el) return;
+  // Don't overwrite while the user is typing
+  if (document.activeElement === el) return;
+  el.value = newValue;
+}}
+
 async function refreshStatus() {{
   try {{
     const res = await fetch("/api/status");
     const data = await res.json();
     document.getElementById("status").textContent = JSON.stringify(data, null, 2);
-    document.getElementById("brightness").value = data.brightness;
-    document.getElementById("speed").value = data.speed;
+
+    safeSetInput("brightness", data.brightness);
+    safeSetInput("speed", data.speed);
+
     renderButtons(data);
   }} catch (e) {{
     document.getElementById("status").textContent = "(status fetch failed) " + e;
@@ -914,12 +1141,12 @@ async def respond_text(writer, body: str, code="200 OK", content_type="text/plai
 async def respond_json(writer, obj, code="200 OK"):
     await respond_text(writer, to_json(obj), code=code, content_type="application/json")
 
-
 # -------------------------------
 # Request handler
 # -------------------------------
 async def handle_client(reader, writer):
     global neopixel_enabled, brightness, speed, demo_mode, demo_interval_s, _last_demo_switch_ms, _demo_idx
+    global progress_mode_enabled, progress_start, progress_end
 
     try:
         request_line = await reader.readline()
@@ -938,13 +1165,11 @@ async def handle_client(reader, writer):
 
         route, params = parse_path_and_query(path)
 
-        # UI
         if route == "/" or route == "/index.html":
             await writer.awrite(html_page())
             await writer.aclose()
             return
 
-        # JSON API
         if route.startswith("/api/"):
             now = time.ticks_ms()
 
@@ -971,9 +1196,9 @@ async def handle_client(reader, writer):
 
             if route == "/api/show":
                 name = as_str(params, "name", "")
-                seconds = as_int(params, "seconds", 8)
-                ok = start_show(name, seconds)
-                await respond_json(writer, {"ok": ok, "message": "OK" if ok else "Unknown show", "show": show_name, "seconds": seconds})
+                seconds = as_int(params, "seconds", SHOW_DEFAULT_SECONDS.get(name, 10))
+                ok, reason = start_show(name, seconds, now_ms=now)
+                await respond_json(writer, {"ok": ok, "message": "OK" if ok else reason, "show": show_name, "seconds": seconds})
                 return
 
             if route == "/api/demo":
@@ -1004,8 +1229,30 @@ async def handle_client(reader, writer):
                 seconds_override = params.get("seconds", None)
                 if seconds_override is not None:
                     seconds_override = as_int(params, "seconds", 8)
-                result = trigger_event(name, seconds_override=seconds_override)
+                result = trigger_event(name, seconds_override=seconds_override, now_ms=now)
                 await respond_json(writer, result)
+                return
+
+            if route == "/api/progress_mode":
+                on = as_str(params, "on", "0").lower()
+                progress_mode_enabled = on in ("1", "true", "yes", "on")
+                await respond_json(writer, {"ok": True, "message": "Progress mode updated", "progress_mode_enabled": progress_mode_enabled})
+                return
+
+            if route == "/api/progress_config":
+                s = as_int(params, "start", progress_start)
+                e = as_int(params, "end", progress_end)
+                # clamp to strip
+                progress_start = int(clamp(s, 0, NEOPIXEL_COUNT - 1))
+                progress_end = int(clamp(e, 0, NEOPIXEL_COUNT - 1))
+                # refresh progress pixel map
+                progress_effect._pixels = get_progress_pixels()
+                await respond_json(writer, {
+                    "ok": True,
+                    "message": "Progress config updated",
+                    "progress_start": progress_start,
+                    "progress_end": progress_end
+                })
                 return
 
             if route == "/api/progress":
@@ -1020,11 +1267,9 @@ async def handle_client(reader, writer):
                 await respond_json(writer, {"ok": True, "message": "Progress updated", "pct": progress_effect.pct, "state": progress_effect.state})
                 return
 
-            # unknown api
             await respond_json(writer, {"ok": False, "message": "Unknown API route"}, code="404 Not Found")
             return
 
-        # Non-api fallback
         await respond_text(writer, "Not found\n", code="404 Not Found")
         return
 
@@ -1035,7 +1280,6 @@ async def handle_client(reader, writer):
             pass
         print("Client error:", e)
 
-
 # -------------------------------
 # Main
 # -------------------------------
@@ -1044,7 +1288,6 @@ async def main():
         return
 
     clear_np()
-
     asyncio.create_task(neopixel_engine_task())
 
     server = asyncio.start_server(handle_client, "0.0.0.0", 80)
@@ -1053,7 +1296,6 @@ async def main():
 
     while True:
         await asyncio.sleep(5)
-
 
 loop = asyncio.get_event_loop()
 loop.create_task(main())
