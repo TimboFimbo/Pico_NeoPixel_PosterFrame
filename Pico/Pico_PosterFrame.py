@@ -1,10 +1,8 @@
-# Poster / Marquee lights - Step 5
-# - Adds Progress Mode (enable/disable)
-# - Progress uses configurable arc (default start=1 end=18) with dim warm trim outside arc
-# - Playing: fill-with-fade + twinkle on filled pixels
-# - Paused: two opposite orbiting bulbs
-# - When progress mode is enabled AND progress is active, show triggers are ignored
-# - /api/status advertises show defaults (UI no longer hardcodes durations)
+# Poster / Marquee lights - Step 5+
+# - Progress Mode
+# - Movie start/stop wipes always visible (grace window)
+# - Gamma easing on progress head fill
+# - Allows movie_start/movie_stop shows even during active progress
 
 import network
 import asyncio
@@ -22,9 +20,11 @@ SSID = config.REMOTE_SSID
 PASSWORD = config.REMOTE_PASSWORD
 
 # Static IP configuration
-static_ip = '192.168.0.250'  # Replace with your desired static IP
+static_ip = '192.168.0.250'
 subnet_mask = '255.255.255.0'
-gateway_ip = '192.168.0.255'
+
+# >>> FIX: gateway must be your router, NOT .255 broadcast
+gateway_ip = '192.168.0.1'
 dns_server = '8.8.8.8'
 
 def init_wifi(ssid: str, password: str) -> bool:
@@ -39,8 +39,8 @@ def init_wifi(ssid: str, password: str) -> bool:
             break
         timeout -= 1
         time.sleep(1)
-        
-    # Set static IP address
+
+    # Set static IP address (after connection)
     wlan.ifconfig((static_ip, subnet_mask, gateway_ip, dns_server))
 
     if wlan.status() != 3:
@@ -144,15 +144,15 @@ EFFECT_CONFIG = {
 
     "progress": {
         "filled_color": WARM,
-        "empty_dim": 0.04,          # within arc, ahead of head
-        "filled_dim": 0.70,         # base brightness for filled pixels
-        "head_dim": 0.85,           # max brightness for active head pixel
+        "empty_dim": 0.04,
+        "filled_dim": 0.70,
+        "head_dim": 0.85,
         "frame_ms": 50,
         "timeout_ms": 30000,
-        "trim_dim": 0.10,           # pixels outside arc (dim warm trim)
-        "twinkle_strength": 0.22,   # how much twinkle modulates filled pixels
-        "pause_step_ms": 170,       # orbit speed
-        "pause_dim": 0.85,          # brightness of orbit bulbs
+        "trim_dim": 0.10,
+        "twinkle_strength": 0.22,
+        "pause_step_ms": 170,
+        "pause_dim": 0.85,
     },
 }
 
@@ -162,6 +162,17 @@ progress_end = 18
 
 # Progress mode toggle (OFF by default)
 progress_mode_enabled = False
+
+# >>> Progress render grace: prevent progress visuals from overriding movie wipes immediately
+PROGRESS_RENDER_GRACE_MS = 1200
+progress_render_block_until_ms = 0
+
+# >>> Gamma easing for progress head fill
+PROGRESS_HEAD_GAMMA = 2.2
+
+def block_progress_rendering(now_ms: int, ms: int = PROGRESS_RENDER_GRACE_MS):
+    global progress_render_block_until_ms
+    progress_render_block_until_ms = time.ticks_add(now_ms, ms)
 
 # -------------------------------
 # URL parsing helpers
@@ -376,7 +387,6 @@ class DoubleChaseShow(Effect):
         self._b = (self._b - 1) % NEOPIXEL_COUNT
 
 class WipeHoldPopShow(Effect):
-    # loops until show time ends
     def __init__(self, cfg):
         self.color = cfg["color"]
         self.pop_color = cfg["pop_color"]
@@ -436,10 +446,6 @@ class WipeHoldPopShow(Effect):
                 self._idx = 0
 
 class MovieWipeOnce(Effect):
-    """
-    Single-run wipe (alternating colors) across the progress arc.
-    Intended for movie_start/movie_stop.
-    """
     def __init__(self, colors, direction=1, step_ms=30):
         self.colors = colors
         self.direction = 1 if direction >= 0 else -1
@@ -464,12 +470,10 @@ class MovieWipeOnce(Effect):
         if not px:
             return
 
-        # dim trim outside arc
         trim_c = neo_color_rgb(*scale_rgb(WARM, EFFECT_CONFIG["progress"]["trim_dim"]))
         for i in range(NEOPIXEL_COUNT):
             np[i] = trim_c
 
-        # render wipe up to pos
         count = min(self._pos + 1, len(px))
         for k in range(count):
             idx = px[k] if self.direction == 1 else px[len(px) - 1 - k]
@@ -479,21 +483,15 @@ class MovieWipeOnce(Effect):
         np.write()
         self._pos += 1
         if self._pos >= len(px):
-            # hold finished frame; engine timer will end show
             self._pos = len(px) - 1
 
 # -------------------------------
-# Progress helpers + Progress effect (v2)
+# Progress helpers + Progress effect
 # -------------------------------
 def normalize_index(i):
-    # allow negatives etc
     return int(i) % NEOPIXEL_COUNT
 
 def get_progress_pixels():
-    """
-    Returns list of pixel indices from progress_start..progress_end inclusive,
-    wrapping if end < start.
-    """
     if NEOPIXEL_COUNT <= 0:
         return []
     s = normalize_index(progress_start)
@@ -506,39 +504,23 @@ def get_progress_pixels():
     return out
 
 class ProgressBarV2(Effect):
-    """
-    /api/progress?pct=0..1&state=playing|paused|stopped
-    If active, and progress mode enabled, it overrides idle and ignores shows.
-    """
     def __init__(self, cfg, twinkle_cfg):
         self.cfg = cfg
         self.tw_cfg = twinkle_cfg
-
         self._next_ms = 0
         self.pct = 0.0
         self.state = "stopped"
         self._last_update_ms = 0
         self._pause_phase = 0.0
-
-
-        # twinkle state (only used for filled pixels)
         self._base = [0.0] * NEOPIXEL_COUNT
         self._tw = [0.0] * NEOPIXEL_COUNT
-
-        # pause orbit state
-        self._pause_next_ms = 0
-        self._pause_pos = 0
-
         self._pixels = []
 
     def reset(self):
         self._next_ms = 0
         self._last_update_ms = 0
-        self._pause_next_ms = 0
-        self._pause_pos = 0
         self._pause_phase = 0.0
         self._pixels = get_progress_pixels()
-        # init twinkle baselines
         for i in range(NEOPIXEL_COUNT):
             self._base[i] = self.tw_cfg["base_min"] + random.random() * (self.tw_cfg["base_max"] - self.tw_cfg["base_min"])
             self._tw[i] = 0.0
@@ -552,7 +534,6 @@ class ProgressBarV2(Effect):
         return time.ticks_diff(now_ms, time.ticks_add(self._last_update_ms, self.cfg["timeout_ms"])) < 0
 
     def _tick_twinkle_state(self):
-        # same feel as idle twinkle but slightly toned
         if random.random() < self.tw_cfg["twinkle_chance"]:
             j = random.randrange(NEOPIXEL_COUNT)
             boost = self.tw_cfg["twinkle_boost_min"] + random.random() * (self.tw_cfg["twinkle_boost_max"] - self.tw_cfg["twinkle_boost_min"])
@@ -574,21 +555,17 @@ class ProgressBarV2(Effect):
         if not neopixel_enabled:
             return
 
-        # refresh pixel arc if config changed
         if not self._pixels:
             self._pixels = get_progress_pixels()
 
         if self.state == "paused":
-            # render paused as "breathing" on filled portion (keeps progress visible)
             if time.ticks_diff(now_ms, self._next_ms) < 0:
                 return
             self._next_ms = time.ticks_add(now_ms, scaled_ms(self.cfg["frame_ms"]))
-
-            self._pause_phase += 0.06  # pulse speed; adjust later if needed
+            self._pause_phase += 0.06
             self._render_paused_breath()
             return
 
-        # playing render timer
         if time.ticks_diff(now_ms, self._next_ms) < 0:
             return
         self._next_ms = time.ticks_add(now_ms, scaled_ms(self.cfg["frame_ms"]))
@@ -624,27 +601,24 @@ class ProgressBarV2(Effect):
 
         filled_color = self.cfg["filled_color"]
 
-        # slow pulse factor (like breath)
-        w = (math.sin(self._pause_phase) + 1.0) * 0.5  # 0..1
-        # pulse the filled region between ~70% and 100% of filled_dim
+        w = (math.sin(self._pause_phase) + 1.0) * 0.5
         base = self.cfg["filled_dim"]
         pulse_scale = 0.10 + 0.90 * w
         filled_s = clamp(base * pulse_scale, 0.0, 1.0)
 
-        # filled pixels pulse
         for k in range(min(filled, n)):
             idx = px[k]
             r, g, b = scale_rgb(filled_color, filled_s)
             np[idx] = neo_color_rgb(r, g, b)
 
-        # head pixel shows partial progress (steady)
         if filled < n:
+            # >>> gamma-eased head fill
+            frac_g = frac ** PROGRESS_HEAD_GAMMA
+            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac_g
             idx = px[filled]
-            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac
             r, g, b = scale_rgb(filled_color, clamp(head_s, 0.0, 1.0))
             np[idx] = neo_color_rgb(r, g, b)
 
-            # unfilled arc remains dim
             empty_c = neo_color_rgb(*scale_rgb(filled_color, self.cfg["empty_dim"]))
             for k in range(filled + 1, n):
                 np[px[k]] = empty_c
@@ -663,7 +637,6 @@ class ProgressBarV2(Effect):
         filled = int(x)
         frac = x - filled
 
-        # clamp indices
         if filled < 0:
             filled = 0
             frac = 0.0
@@ -672,15 +645,12 @@ class ProgressBarV2(Effect):
             frac = 1.0
 
         filled_color = self.cfg["filled_color"]
-
-        # render filled pixels with twinkle
         strength = self.cfg["twinkle_strength"]
         base_dim = self.cfg["filled_dim"]
 
         for k in range(min(filled, n)):
             idx = px[k]
             level = self._base[idx] + self._tw[idx]
-            # normalize around twinkle's min/max into ~0..1
             tw_min = self.tw_cfg["base_min"]
             tw_max = self.tw_cfg["base_max"] + self.tw_cfg["twinkle_boost_max"]
             t = (level - tw_min) / max(0.0001, (tw_max - tw_min))
@@ -689,20 +659,17 @@ class ProgressBarV2(Effect):
             r, g, b = scale_rgb(filled_color, s)
             np[idx] = neo_color_rgb(r, g, b)
 
-        # render head pixel fade-up
         if filled < n:
+            # >>> gamma-eased head fill
+            frac_g = frac ** PROGRESS_HEAD_GAMMA
+            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac_g
             idx = px[filled]
-            head_s = self.cfg["empty_dim"] + (self.cfg["head_dim"] - self.cfg["empty_dim"]) * frac
             r, g, b = scale_rgb(filled_color, clamp(head_s, 0.0, 1.0))
             np[idx] = neo_color_rgb(r, g, b)
 
-            # pixels ahead in arc (within arc) get empty_dim
             empty_c = neo_color_rgb(*scale_rgb(filled_color, self.cfg["empty_dim"]))
             for k in range(filled + 1, n):
                 np[px[k]] = empty_c
-        else:
-            # fully complete: all arc pixels filled (twinkle)
-            pass
 
         np.write()
 
@@ -718,7 +685,6 @@ SHOW_EFFECTS = {
     "wipe": WipeHoldPopShow(EFFECT_CONFIG["wipe_show"]),
     "double": DoubleChaseShow(EFFECT_CONFIG["double_show"]),
     "marquee": MarqueeChase(EFFECT_CONFIG["marquee"]),
-    # movie-specific wipes (single-run, timer still bounds it)
     "movie_play": MovieWipeOnce(colors=[RED, SOFT_WARM], direction=1, step_ms=28),
     "movie_stop": MovieWipeOnce(colors=[SOFT_WARM, RED], direction=-1, step_ms=28),
 }
@@ -751,7 +717,6 @@ progress_effect.reset()
 
 EVENT_MAP = {
     "bulb_change": {"shows": ["wipe", "double", "marquee"], "seconds": 8},
-    # for Jellyfin brain to call:
     "movie_start": {"shows": ["movie_play"], "seconds": 6},
     "movie_pause": {"shows": ["double"], "seconds": 6},
     "movie_stop":  {"shows": ["movie_stop"], "seconds": 6},
@@ -760,6 +725,9 @@ EVENT_MAP = {
 _event_rotator = {k: 0 for k in EVENT_MAP.keys()}
 
 def in_active_progress(now_ms: int) -> bool:
+    # >>> Grace window: progress updates still arrive, but visuals are blocked briefly
+    if time.ticks_diff(now_ms, progress_render_block_until_ms) < 0:
+        return False
     return progress_mode_enabled and progress_effect.active(now_ms) and progress_effect.state != "stopped"
 
 def set_idle(name: str) -> bool:
@@ -771,14 +739,14 @@ def set_idle(name: str) -> bool:
     idle_effect.reset()
     return True
 
-def start_show(name: str, seconds: int, now_ms: int = None) -> (bool, str):
+def start_show(name: str, seconds: int, now_ms: int = None, allow_during_progress: bool = False) -> (bool, str):
     global show_active, show_name, show_effect, show_until_ms
 
     if now_ms is None:
         now_ms = time.ticks_ms()
 
-    # Ignore shows while active progress is driving visuals
-    if in_active_progress(now_ms):
+    # Ignore shows while active progress is driving visuals, unless explicitly allowed
+    if (not allow_during_progress) and in_active_progress(now_ms):
         return (False, "ignored_during_progress")
 
     if name not in SHOW_EFFECTS:
@@ -803,10 +771,6 @@ def trigger_event(event_name: str, seconds_override: int = None, now_ms: int = N
     if now_ms is None:
         now_ms = time.ticks_ms()
 
-    # Ignore show-starting events while active progress is driving visuals
-    if in_active_progress(now_ms):
-        return {"ok": True, "event": event_name, "message": "ignored_during_progress"}
-
     if event_name not in EVENT_MAP:
         return {"ok": False, "event": event_name, "message": "Unknown event"}
 
@@ -823,7 +787,12 @@ def trigger_event(event_name: str, seconds_override: int = None, now_ms: int = N
     if seconds_override is not None:
         seconds = int(clamp(seconds_override, 1, 60))
 
-    ok, reason = start_show(chosen, seconds, now_ms=now_ms)
+    # >>> Allow movie start/stop wipes even during progress, but block progress visuals briefly
+    allow = event_name in ("movie_start", "movie_stop")
+    if allow and chosen in ("movie_play", "movie_stop"):
+        block_progress_rendering(now_ms)
+
+    ok, reason = start_show(chosen, seconds, now_ms=now_ms, allow_during_progress=allow)
     return {
         "ok": ok,
         "event": event_name,
@@ -896,7 +865,6 @@ async def neopixel_engine_task():
             await asyncio.sleep_ms(50)
             continue
 
-        # demo cycles idle effects only when not showing and not active progress
         if demo_mode and (not show_active) and (not in_active_progress(now)):
             if _last_demo_switch_ms == 0:
                 _last_demo_switch_ms = now
@@ -905,22 +873,19 @@ async def neopixel_engine_task():
                 set_idle(_demo_order[_demo_idx])
                 _last_demo_switch_ms = now
 
-        # If active progress is driving, it overrides everything (per your spec)
+        # If active progress is driving, it overrides everything
         if in_active_progress(now):
-            # ensure any existing show doesn't keep running behind the scenes
             if show_active:
                 stop_show()
             progress_effect.tick(now)
             await asyncio.sleep_ms(10)
             continue
 
-        # otherwise: shows then idle/progress fallback (progress only if enabled? no: still allowed)
         if show_active and show_effect is not None:
             show_effect.tick(now)
             if time.ticks_diff(now, show_until_ms) >= 0:
                 stop_show()
         else:
-            # if progress mode is enabled but not active (timed out), just idle
             idle_effect.tick(now)
 
         await asyncio.sleep_ms(10)
@@ -1157,7 +1122,6 @@ async def handle_client(reader, writer):
         parts = request_line.decode().split()
         path = parts[1] if len(parts) >= 2 else "/"
 
-        # drain headers
         while True:
             line = await reader.readline()
             if not line or line == b"\r\n":
@@ -1197,7 +1161,13 @@ async def handle_client(reader, writer):
             if route == "/api/show":
                 name = as_str(params, "name", "")
                 seconds = as_int(params, "seconds", SHOW_DEFAULT_SECONDS.get(name, 10))
-                ok, reason = start_show(name, seconds, now_ms=now)
+
+                # >>> If manually running movie wipes, also apply grace + allow during progress
+                allow = name in ("movie_play", "movie_stop")
+                if allow:
+                    block_progress_rendering(now)
+
+                ok, reason = start_show(name, seconds, now_ms=now, allow_during_progress=allow)
                 await respond_json(writer, {"ok": ok, "message": "OK" if ok else reason, "show": show_name, "seconds": seconds})
                 return
 
@@ -1242,10 +1212,8 @@ async def handle_client(reader, writer):
             if route == "/api/progress_config":
                 s = as_int(params, "start", progress_start)
                 e = as_int(params, "end", progress_end)
-                # clamp to strip
                 progress_start = int(clamp(s, 0, NEOPIXEL_COUNT - 1))
                 progress_end = int(clamp(e, 0, NEOPIXEL_COUNT - 1))
-                # refresh progress pixel map
                 progress_effect._pixels = get_progress_pixels()
                 await respond_json(writer, {
                     "ok": True,
@@ -1300,3 +1268,4 @@ async def main():
 loop = asyncio.get_event_loop()
 loop.create_task(main())
 loop.run_forever()
+

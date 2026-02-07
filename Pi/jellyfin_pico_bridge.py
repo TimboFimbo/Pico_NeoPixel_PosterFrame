@@ -50,6 +50,9 @@ POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2.0"))             # Jellyfin po
 PICO_STATUS_SECONDS = float(os.getenv("PICO_STATUS_SECONDS", "10"))# How often to check Pico status
 SESSION_GRACE_S = float(os.getenv("SESSION_GRACE_S", "10"))         # Hold last session state this long if session disappears briefly
 
+PROGRESS_HOLDOFF_S = float(os.getenv("PROGRESS_HOLDOFF_S", "1.0"))
+suppress_progress_until = 0.0
+
 # NPS (MOSFET) control
 NPS_ENABLED = os.getenv("NPS_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 NPS_GPIO = int(os.getenv("NPS_GPIO", "18"))
@@ -259,7 +262,9 @@ def main():
             if snap.state == "playing":
                 if last.state != "playing" or item_changed:
                     pico_call(pico, "/api/event?name=movie_start", timeout=4.0)
-                pico_call(pico, f"/api/progress?pct={snap.pct:.6f}&state=playing", timeout=4.0)
+                    suppress_progress_until = time.monotonic() + PROGRESS_HOLDOFF_S
+                    if time.monotonic() >= suppress_progress_until:
+                        pico_call(pico, f"/api/progress?pct={snap.pct:.6f}&state=playing", timeout=4.0)
 
             elif snap.state == "paused":
                 if last.state != "paused":
@@ -269,7 +274,9 @@ def main():
             else:
                 if last.state != "stopped":
                     pico_call(pico, "/api/event?name=movie_stop", timeout=4.0)
-                pico_call(pico, "/api/progress?state=stopped", timeout=4.0)
+                    suppress_progress_until = time.monotonic() + PROGRESS_HOLDOFF_S
+                    if time.monotonic() >= suppress_progress_until:
+                        pico_call(pico, "/api/progress?state=stopped", timeout=4.0)
 
             if snap.state != last.state or item_changed:
                 print(f"[{time.strftime('%H:%M:%S')}] {snap.state.upper()} pct={snap.pct:.3f} title={snap.title}")
